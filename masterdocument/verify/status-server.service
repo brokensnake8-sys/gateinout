@@ -1,0 +1,12 @@
+[Unit]
+Description=Fingerprint Status Server
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/verify/status_server.py
+Restart=always
+User=pi
+WorkingDirectory=/home/pi/verify
+
+[Install]
+WantedBy=multi-user.target

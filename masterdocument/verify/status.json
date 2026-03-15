@@ -1,0 +1,22 @@
+{
+  "fpa83bafde75ea45_f992d889c-04b3-": {
+    "status": "IN",
+    "name": "",
+    "last_event": "2026-03-15T13:23:53"
+  },
+  "fpa83bafde75ea45_f992d8e5a-04b3-": {
+    "status": "IN",
+    "name": "yasin",
+    "last_event": "2026-03-15T11:58:57"
+  },
+  "fpa83bafde75ea45_f992d8fc2-04b3-": {
+    "status": "OUT",
+    "name": "",
+    "last_event": "2026-03-15T13:18:26"
+  },
+  "fpa83bafde75ea4550b8bc5fe29223cf": {
+    "status": "IN",
+    "name": "",
+    "last_event": "2026-03-15T12:40:28"
+  }
+}

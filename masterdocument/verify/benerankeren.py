@@ -1,0 +1,411 @@
+"""
+Fingerprint Attendance V2 — Gate IN / Gate OUT
+- Set GATE_MODE = "IN" di RPi gate masuk
+- Set GATE_MODE = "OUT" di RPi gate keluar
+- Status user (IN/OUT) disimpan di STATUS_FILE (shared via NFS di RPi A)
+- Orang tidak bisa IN kalau belum OUT, tidak bisa OUT kalau belum IN
+
+Run: sudo python3 fingerprint_verify_v2.py
+"""
+
+import tkinter as tk
+import threading
+import requests
+import base64
+import subprocess
+import os
+import json
+from datetime import datetime
+
+# fpwrap: libfprint langsung → 1 scan identify semua template
+from fpwrap import identify_from_dir
+
+# relay dinonaktifkan sementara
+def trigger_relay(): pass
+
+# ── CONFIG — UBAH SESUAI RPi ──────────────────────────────────────────────────
+GATE_MODE   = "IN"   # "IN" atau "OUT"
+
+API_URL     = "https://machine.haloraga.com/api/v1/attendance-via-finger"
+FPRINT_DIR  = "/var/lib/fprint"
+BASE_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data scan gui")
+
+# RPi A: "http://localhost:5050"
+# RPi B: "http://192.168.1.xxx:5050"  ← ganti IP RPi A
+STATUS_SERVER = "http://localhost:5050"
+
+
+
+BG    = "#0e1118"
+CARD  = "#161b27"
+BORD  = "#252d40"
+BLUE  = "#2563eb"
+GREEN = "#16a34a"
+RED   = "#dc2626"
+YEL   = "#ca8a04"
+WHITE = "#f1f5f9"
+GRAY  = "#475569"
+LBLUE = "#60a5fa"
+ORNG  = "#ea580c"
+
+
+
+
+# ── STATUS HELPERS — via HTTP ke status_server.py di RPi A ───────────────────
+def get_user_status(uid: str) -> str:
+    """Ambil status user dari status_server. Default OUT."""
+    try:
+        resp = requests.get(f"{STATUS_SERVER}/status/{uid}", timeout=3)
+        return resp.json().get("status", "OUT")
+    except Exception as e:
+        print(f"[WARN] get_user_status: {e}")
+        return "OUT"
+
+def set_user_status(uid: str, status: str, name: str = ""):
+    """Set status user ke status_server."""
+    try:
+        requests.post(f"{STATUS_SERVER}/status/{uid}", json={
+            "status":     status,
+            "name":       name,
+            "last_event": datetime.now().isoformat(timespec="seconds")
+        }, timeout=3)
+        print(f"[STATUS] {uid} → {status}")
+    except Exception as e:
+        print(f"[WARN] set_user_status: {e}")
+
+def check_gate_allowed(uid: str) -> tuple:
+    """
+    Cek apakah user boleh lewat gate ini.
+    Return: (allowed: bool, reason: str)
+    """
+    current = get_user_status(uid)
+
+    if GATE_MODE == "IN":
+        if current == "OUT":
+            return True, "Silakan masuk"
+        else:
+            return False, "Anda sudah TAP-IN\nSilakan TAP-OUT dulu di gate keluar"
+
+    elif GATE_MODE == "OUT":
+        if current == "IN":
+            return True, "Silakan keluar"
+        else:
+            return False, "Anda belum TAP-IN\nSilakan masuk lewat gate masuk dulu"
+
+    return False, f"GATE_MODE tidak valid: {GATE_MODE}"
+
+
+
+# ── FPRINT HELPERS ─────────────────────────────────────────────────────────────
+def read_template(uid: str) -> bytes:
+    user_dir = os.path.join(FPRINT_DIR, uid)
+    r = subprocess.run(["sudo", "find", user_dir, "-type", "f"],
+                       capture_output=True, text=True)
+    files = sorted([f.strip() for f in r.stdout.splitlines() if f.strip()])
+    if not files: return b""
+    r2 = subprocess.run(["sudo", "cat", files[0]], capture_output=True)
+    return r2.stdout if r2.returncode == 0 else b""
+
+def send_to_api(uid: str) -> dict:
+    template = read_template(uid)
+    if not template:
+        raise RuntimeError(f"Gagal baca template: {uid}")
+    finger_b64 = base64.b64encode(template).decode()
+    resp = requests.post(API_URL, json={"finger": finger_b64}, timeout=10)
+    resp.raise_for_status()
+    result = resp.json()
+    result["_finger_b64"] = finger_b64
+    return result
+
+def save_log(data: dict, msg="", status="BERHASIL", finger_b64=""):
+    now  = datetime.now()
+    path = os.path.join(BASE_DIR, now.strftime("%d%m%Y_%H%M%S"))
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "scan_result.txt"), "w", encoding="utf-8") as f:
+        f.write(f"Waktu  : {now.strftime('%d-%m-%Y %H:%M:%S')}\n")
+        f.write(f"Gate   : {GATE_MODE}\n")
+        f.write(f"Status : {status}\n")
+        f.write(f"Nama   : {data.get('name','—')}\n")
+        f.write(f"Paket  : {data.get('packet','—')}\n")
+        f.write(f"Exp    : {data.get('expDate','—')}\n")
+        f.write(f"ClockIn: {data.get('clockIn','—')}\n")
+        f.write(f"Note   : {msg}\n")
+    if finger_b64:
+        with open(os.path.join(path, "finger_data.txt"), "w") as f:
+            f.write(finger_b64)
+
+
+# ── SCANNER — pakai libfprint langsung via fpwrap ────────────────────────────
+
+def scan_once(on_progress=None) -> str | None:
+    """
+    Scan jari 1x → identify_from_dir → langsung ketemu siapa.
+    Return: path file template yang match, atau None.
+    """
+    if on_progress: on_progress("SCANNING... tempelkan jari")
+    matched_path = identify_from_dir(FPRINT_DIR)
+    return matched_path
+
+# ── GUI ────────────────────────────────────────────────────────────────────────
+GATE_COLOR = GREEN if GATE_MODE == "IN" else ORNG
+GATE_LABEL = "GATE MASUK" if GATE_MODE == "IN" else "GATE KELUAR"
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"Finger Attendance — {GATE_LABEL}")
+        self.geometry("400x660")
+        self.resizable(False, False)
+        self.configure(bg=BG)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._anim_id  = None
+        self._anim_i   = 0
+        self._scanning = False
+        self._build()
+        self.after(500, self._start_scan)
+
+    def _on_close(self):
+        self._scanning = False
+        self.destroy()
+
+    def _build(self):
+        tk.Frame(self, bg=BG, height=20).pack(fill="x")
+        tk.Label(self, text="HALORAGA GYM", bg=BG, fg=LBLUE,
+                 font=("Courier New", 10, "bold")).pack()
+        tk.Label(self, text="Fingerprint Attendance V2", bg=BG, fg=WHITE,
+                 font=("Courier New", 15, "bold")).pack()
+        tk.Frame(self, bg=BG, height=4).pack(fill="x")
+
+        # Badge gate mode
+        badge = tk.Frame(self, bg=GATE_COLOR)
+        badge.pack(padx=80, fill="x")
+        tk.Label(badge, text=f"  {GATE_LABEL}  ", bg=GATE_COLOR, fg=WHITE,
+                 font=("Courier New", 11, "bold")).pack(pady=4)
+
+        tk.Frame(self, bg=BG, height=10).pack(fill="x")
+
+        card = tk.Frame(self, bg=CARD, highlightbackground=BORD, highlightthickness=1)
+        card.pack(padx=24, fill="x")
+        self.canvas = tk.Canvas(card, width=140, height=140, bg=CARD, highlightthickness=0)
+        self.canvas.pack(pady=20)
+        self._draw_icon(GRAY)
+        self.lbl_status = tk.Label(card, text="MEMULAI...", bg=CARD, fg=WHITE,
+                                   font=("Courier New", 15, "bold"))
+        self.lbl_status.pack()
+        self.lbl_sub = tk.Label(card, text="Inisialisasi...",
+                                bg=CARD, fg=GRAY, font=("Courier New", 9), wraplength=320)
+        self.lbl_sub.pack(pady=(4, 20))
+
+        tk.Frame(self, bg=BG, height=10).pack(fill="x")
+        self.btn = tk.Button(self, text="⏹  STOP",
+                             bg=RED, fg=WHITE, font=("Courier New", 11, "bold"),
+                             relief="flat", bd=0, padx=16, pady=10, cursor="hand2",
+                             activebackground="#b91c1c", activeforeground=WHITE,
+                             command=self._toggle_scan)
+        self.btn.pack(padx=24, fill="x")
+
+        tk.Frame(self, bg=BG, height=10).pack(fill="x")
+        rf = tk.Frame(self, bg=CARD, highlightbackground=BORD, highlightthickness=1)
+        rf.pack(padx=24, fill="both", expand=True)
+        tk.Label(rf, text="HASIL TERAKHIR", bg=CARD, fg=GRAY,
+                 font=("Courier New", 8, "bold"), anchor="w").pack(fill="x", padx=12, pady=(10,0))
+
+        self.rvars = {}
+        for key, label in [("name","Nama"), ("cardNumber","No.Card"),
+                            ("packet","Paket"), ("expDate","Exp. Date"), ("clockIn","Clock In")]:
+            row = tk.Frame(rf, bg=CARD)
+            row.pack(fill="x", padx=12, pady=2)
+            tk.Label(row, text=f"{label:<10} :", bg=CARD, fg=GRAY,
+                     font=("Courier New", 9)).pack(side="left")
+            v = tk.StringVar(value="—")
+            tk.Label(row, textvariable=v, bg=CARD, fg=WHITE,
+                     font=("Courier New", 9, "bold")).pack(side="left", padx=6)
+            self.rvars[key] = v
+
+        tk.Frame(rf, bg=BORD, height=1).pack(fill="x", padx=12, pady=(8,4))
+        sr = tk.Frame(rf, bg=CARD)
+        sr.pack(fill="x", padx=12, pady=(0,4))
+        tk.Label(sr, text="Status    :", bg=CARD, fg=GRAY,
+                 font=("Courier New", 9)).pack(side="left")
+        self.v_source = tk.StringVar(value="—")
+        tk.Label(sr, textvariable=self.v_source, bg=CARD, fg=LBLUE,
+                 font=("Courier New", 8, "bold")).pack(side="left", padx=6)
+        tk.Frame(rf, bg=CARD, height=10).pack(fill="x")
+
+        tk.Frame(self, bg=BG, height=6).pack(fill="x")
+        tk.Label(self, text=f"Auto-scan  •  {GATE_LABEL}  •  status.json shared",
+                 bg=BG, fg=GRAY, font=("Courier New", 7)).pack()
+        tk.Frame(self, bg=BG, height=8).pack(fill="x")
+
+    # ── scan ──────────────────────────────────────────────────────────────────
+    def _start_scan(self):
+        if self._scanning: return
+        self._scanning = True
+        self.btn.config(text="⏹  STOP", bg=RED, activebackground="#b91c1c")
+        self._set_status("SCANNING", LBLUE)
+        self._set_sub("Tempelkan jari pada scanner")
+        self._start_anim()
+        self._scan_loop()
+
+    def _scan_loop(self):
+        """Loop scan terus via fpwrap — 1 scan langsung ketemu."""
+        if not self._scanning: return
+        threading.Thread(target=self._do_scan_once, daemon=True).start()
+
+    def _do_scan_once(self):
+        """Jalankan 1x identify di thread terpisah."""
+        try:
+            matched_path = scan_once(
+                on_progress=lambda m: self.after(0, lambda msg=m: self._set_sub(msg))
+            )
+            if matched_path:
+                # Extract username dari path: /var/lib/fprint/username/...
+                parts = matched_path.replace(FPRINT_DIR, "").strip("/").split("/")
+                uid   = parts[0] if parts else matched_path
+                self.after(0, lambda u=uid: self._handle_match(u))
+            else:
+                # No match — scan lagi
+                if self._scanning:
+                    self.after(200, self._scan_loop)
+        except Exception as ex:
+            print(f"[ERROR] scan: {ex}")
+            if self._scanning:
+                self.after(1000, self._scan_loop)
+
+    def _stop_scan(self):
+        if not self._scanning: return
+        self._scanning = False
+        self._stop_anim()
+        self.btn.config(text="▶  START", bg=BLUE, activebackground="#1d4ed8")
+        self._set_status("BERHENTI", GRAY)
+        self._set_sub("Tekan START untuk scan")
+        self._draw_icon(GRAY)
+
+    def _toggle_scan(self):
+        if self._scanning: self._stop_scan()
+        else: self._start_scan()
+
+    # ── match → cek gate dulu ─────────────────────────────────────────────────
+    def _handle_match(self, uid):
+        self._stop_anim()
+
+        allowed, reason = check_gate_allowed(uid)
+
+        if not allowed:
+            # Ditolak — tampilkan alasan, tidak buka relay
+            self._draw_icon(RED)
+            self._set_status("✗ DITOLAK", RED)
+            self._set_sub(reason)
+            self.v_source.set("✗ DENIED")
+            print(f"[GATE] {uid} DENIED: {reason}")
+            if self._scanning:
+                self.after(2000, self._resume_scan)
+            return
+
+        # Boleh lewat — update status dan buka relay
+        self._draw_icon(LBLUE)
+        self._set_status(f"✓ {GATE_LABEL}", GATE_COLOR)
+        self._set_sub("Mengirim ke server...")
+
+        # Update status lokal DULU sebelum API
+        new_status = "IN" if GATE_MODE == "IN" else "OUT"
+        set_user_status(uid, new_status)
+
+        # Kirim ke API di background
+        def worker():
+            try:
+                result = send_to_api(uid)
+                self.after(0, lambda r=result, u=uid: self._on_api_done(r, u))
+            except Exception as ex:
+                self.after(0, lambda m=str(ex): self._on_api_error(m))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_api_done(self, result: dict, uid: str):
+        msg        = result.get("message", "")
+        data       = result.get("data") or {}
+        finger_b64 = result.get("_finger_b64", "")
+
+        if data:
+            self._draw_icon(GREEN)
+            self._set_status("✓ BERHASIL", GREEN)
+            self._set_sub(msg)
+            self.v_source.set(f"✓ {GATE_LABEL}")
+            self.rvars["name"].set(data.get("name", "—"))
+            self.rvars["cardNumber"].set(data.get("cardNumber", "—"))
+            self.rvars["packet"].set(data.get("packet", "—"))
+            self.rvars["expDate"].set(data.get("expDate", "—"))
+            self.rvars["clockIn"].set(data.get("clockIn", "—"))
+            # Update name di status file
+            name = data.get("name", "")
+            if name:
+                new_status = "IN" if GATE_MODE == "IN" else "OUT"
+                set_user_status(uid, new_status, name)
+            try: save_log(data, msg, "BERHASIL", finger_b64)
+            except: pass
+        else:
+            self._draw_icon(YEL)
+            self._set_status("Tidak Dikenali", YEL)
+            self._set_sub(msg or "Tidak ditemukan di server")
+            self.v_source.set("⚠ NOT FOUND")
+
+        self.after(1000, self._scan_loop)
+
+    def _on_api_error(self, msg: str):
+        self._draw_icon(RED)
+        self._set_status("✗ API ERROR", RED)
+        self._set_sub(msg)
+        self.v_source.set("✗ ERROR")
+        self.after(1000, self._scan_loop)
+
+
+
+
+
+    # ── anim ──────────────────────────────────────────────────────────────────
+    ANIM_C = [LBLUE, "#93c5fd", "#bfdbfe", "#93c5fd"]
+
+    def _start_anim(self):
+        self._anim_i = 0
+        def step():
+            if not self._scanning: return
+            self._draw_icon(self.ANIM_C[self._anim_i % 4], pulse=True)
+            self._anim_i += 1
+            self._anim_id = self.after(350, step)
+        step()
+
+    def _stop_anim(self):
+        if self._anim_id:
+            self.after_cancel(self._anim_id)
+            self._anim_id = None
+
+    def _draw_icon(self, color, pulse=False):
+        self.canvas.delete("all")
+        cx = cy = 70
+        if pulse:
+            self.canvas.create_oval(cx-62, cy-62, cx+62, cy+62,
+                                    outline=color, width=1, dash=(4, 6))
+        for i, r in enumerate([54, 43, 32, 22, 13]):
+            self.canvas.create_arc(cx-r, cy-r, cx+r, cy+r,
+                                   start=210+i*4, extent=120-i*8,
+                                   style="arc", outline=color,
+                                   width=2 if i==0 else 1.5)
+        self.canvas.create_oval(cx-4, cy-4, cx+4, cy+4, fill=color, outline="")
+
+    def _set_status(self, text, color=WHITE): self.lbl_status.config(text=text, fg=color)
+    def _set_sub(self, text):                self.lbl_sub.config(text=text)
+
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print(f"HALORAGA GYM — {GATE_LABEL}")
+    print(f"STATUS_SERVER: {STATUS_SERVER}")
+    print("=" * 50)
+    print()
+    import subprocess, os
+    r = subprocess.run(["sudo","find",FPRINT_DIR,"-mindepth","1","-maxdepth","1","-type","d"], capture_output=True, text=True)
+    users = [os.path.basename(p.strip()) for p in r.stdout.splitlines() if p.strip()]
+    print(f"[INFO] {len(users)} user di fprint:")
+    for u in users: print(f"  - {u}")
+    print()
+    App().mainloop()

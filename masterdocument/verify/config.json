@@ -1,0 +1,7 @@
+{
+  "GATE_MODE": "IN",
+  "STATUS_SERVER": "http://localhost:5050",
+  "API_URL": "https://machine.haloraga.com/api/v1/attendance-via-finger",
+  "FPRINT_DIR": "/var/lib/fprint",
+  "RESULT_SECONDS": 2000
+}
